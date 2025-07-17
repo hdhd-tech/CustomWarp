@@ -399,6 +399,7 @@ python -m warp.tests
 
 ## Building
 
+可能遇到的一些问题可参考 飞书文档的附录部分 https://scn02pub2wsk.feishu.cn/wiki/HNI8w4Oe6iTAWjkMiUVccwlbnsf
 For developers who want to build the library themselves, the following tools are required:
 
 * Microsoft Visual Studio 2019 upwards (Windows)
