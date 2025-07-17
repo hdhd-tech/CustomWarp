@@ -643,18 +643,153 @@ def replay_limited_counter_increment(
 ):
     return tids[tid]
 
+'''
+    自定义算子
+'''
+
+@wp.kernel
+def create_self_point_triangle_contacts(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_invmass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_shape: wp.uint64,  
+    intersecting_particles: wp.array(dtype=int),
+    point_tri_contact_max: int,
+    gravity: wp.vec3,
+    dt: float,
+    # outputs
+    point_tri_contact_count: wp.array(dtype=int),
+    point_tri_contact_pairs: wp.array(dtype=wp.vec2i),
+    point_tri_contact_filter: wp.array(dtype=bool),  
+    point_tri_contact_sidedness: wp.array(dtype=bool)
+):
+    """Collect point-triangle contact pairs: pair information and the side of the point w.r.t. triangle norm"""
+    # Current particle
+    tid = wp.tid()
+    particle_index = tid
+
+    if intersecting_particles[particle_index] == 1:
+        # Don't add self contacts for particles that are already intersecting
+        # Allows not to force preserve the existing collisions
+        return
+
+    p = particle_x[particle_index]
+    vp = particle_v[particle_index]
+    wpoint = particle_invmass[particle_index]
+    radius = particle_radius[particle_index]  # NOTE == Thickness? 
+
+    mesh = wp.mesh_get(particle_shape)
+
+    # Parameters
+    # TODO from outside
+    max_distance = radius * 3.  #  NOTE: Following the recommendation from here: https://carmencincotti.com/2022-11-21/cloth-self-collisions/#the-instability-problem
+    scr = radius * 0.5
+
+    dist_vec = wp.vec3(max_distance, max_distance, max_distance)
+    lower = p - dist_vec
+    upper = p + dist_vec
+
+    # Eval number of contacts
+    query = wp.mesh_query_aabb(particle_shape, lower, upper)
+    face_index = int(0)
+    max_count = int(0)
+    while wp.mesh_query_aabb_next(query, face_index):
+        max_count += 1
+
+    if max_count < 1:
+        return  # no contacts (unlikely)
+    
+    # Create space for new contacts
+    index = wp.atomic_add(point_tri_contact_count, 0, max_count)
+    if index + max_count - 1 >= point_tri_contact_max:
+        printf("\n Number of particle-triangle contacts (%d) exceeded limit (%d). Increase Model.point_tri_contact_max.", 
+               int(float(index + max_count - 1) / float(particle_x.shape[0])), 
+               int(float(point_tri_contact_max) / float(particle_x.shape[0])))
+        return
+
+    # Record contacts
+    query = wp.mesh_query_aabb(particle_shape, lower, upper)
+    face_index = int(0)
+    f_contact_index = int(0)
+    while wp.mesh_query_aabb_next(query, face_index):
+        p0_idx = mesh.indices[face_index * 3 + 0]
+        p1_idx = mesh.indices[face_index * 3 + 1]
+        p2_idx = mesh.indices[face_index * 3 + 2]
+
+        # Don't include its own face
+        if p0_idx == tid or p1_idx == tid or p2_idx == tid:
+            point_tri_contact_filter[index + f_contact_index] = True
+        else: # Potential collision
+            # Evaluate contact sidedness
+            p0 = particle_x[p0_idx] 
+            p1 = particle_x[p1_idx] 
+            p2 = particle_x[p2_idx] 
+
+            v0 = particle_v[p0_idx]
+            v1 = particle_v[p1_idx]
+            v2 = particle_v[p2_idx]
+
+            w0 = particle_invmass[p0_idx]
+            w1 = particle_invmass[p1_idx]
+            w2 = particle_invmass[p2_idx]
+
+            # Closest point
+            bary_closest = triangle_closest_point_barycentric(p0, p1, p2, p)
+            baryAlpha, baryBeta, baryGamma = bary_closest[0], bary_closest[1], bary_closest[2]
+            pC = baryAlpha * p0 + baryBeta * p1 + baryGamma * p2
+
+            # Check contact potential 
+            # Project points: apply velocity
+            # TODO Other external forces
+            projP = p + vp * dt + wpoint * dt * dt * gravity
+            projP0 = p0 + v0 * dt + w0 * dt * dt * gravity
+            projP1 = p1 + v1 * dt + w1 * dt * dt * gravity
+            projP2 = p2 + v2 * dt + w2 * dt * dt * gravity
+
+            d = projP - p
+            d0 = projP0 - p0
+            d1 = projP1 - p1
+            d2 = projP2 - p2
+            dC = (d0 * baryAlpha) + (d1 * baryBeta) + (d2 * baryGamma)  
+            lDir = wp.normalize(pC - p)
+
+            dcProj = wp.dot(dC, lDir)
+            dProj = wp.dot(d, lDir)
+
+            distC = wp.length(pC - p)
+            distC_after = distC - dProj + dcProj 
+
+            if distC_after < 2. * radius + scr:
+                # Evaluate sidedness
+                normal = wp.cross(p1 - p0, p2 - p0) 
+                n_hat = wp.normalize(normal) 
+
+                # Asuming the current point-triangle relation is the correct one
+                cosTheta = wp.dot(n_hat, p - p0)
+        
+                # cosTheta < 0 indicates that the triangle norm should be flipped 
+                point_tri_contact_sidedness[index + f_contact_index] = (cosTheta < 0)  
+                point_tri_contact_pairs[index + f_contact_index] = wp.vec2i(particle_index, face_index)
+
+            else:
+                point_tri_contact_filter[index + f_contact_index] = True
+            
+        f_contact_index += 1
+
+
 
 @wp.kernel
 def create_soft_contacts(
-    particle_x: wp.array(dtype=wp.vec3),
-    particle_radius: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.uint32),
-    body_X_wb: wp.array(dtype=wp.transform),
-    shape_X_bs: wp.array(dtype=wp.transform),
-    shape_body: wp.array(dtype=int),
-    geo: ModelShapeGeometry,
-    margin: float,
-    soft_contact_max: int,
+    particle_x: wp.array(dtype=wp.vec3), # 粒子位置
+    particle_radius: wp.array(dtype=float), # 粒子半径
+    particle_flags: wp.array(dtype=wp.uint32), # 粒子是否激活
+    body_X_wb: wp.array(dtype=wp.transform), # 所有缸体的位置姿态，选一个
+    shape_X_bs: wp.array(dtype=wp.transform), # 形状的局部相对变换
+    shape_body: wp.array(dtype=int), # 所属body索引
+    geo: ModelShapeGeometry,   #形状的几何信息
+    margin: float,  # 宽裕度
+    soft_contact_max: int, # 最多检测数
     shape_count: int,
     # outputs
     soft_contact_count: wp.array(dtype=int),
@@ -1236,7 +1371,8 @@ def handle_contact_pairs(
         p_b_body = closest_point_box(geo_scale_b, query_b)
         p_b_world = wp.transform_point(X_ws_b, p_b_body)
         diff = p_a_world - p_b_world
-
+        # use center of box A to query normal to make sure we are not inside B
+        query_b = wp.transform_point(X_sw_b, wp.transform_get_translation(X_ws_a))
         normal = wp.transform_vector(X_ws_b, box_sdf_grad(geo_scale_b, query_b))
         distance = wp.dot(diff, normal)
 
@@ -1562,6 +1698,7 @@ def collide(
     edge_sdf_iter: int = 10,
     iterate_mesh_vertices: bool = True,
     requires_grad: Optional[bool] = None,
+    dt = None
 ) -> None:
     """Generate contact points for the particles and rigid bodies in the model for use in contact-dynamics kernels.
 
@@ -1582,6 +1719,7 @@ def collide(
         # generate soft contacts for particles and shapes except ground plane (last shape)
         if model.particle_count and model.shape_count > 1:
             if requires_grad:
+                # 为什么需要grad时会清空
                 model.soft_contact_body_pos = wp.empty_like(model.soft_contact_body_pos)
                 model.soft_contact_body_vel = wp.empty_like(model.soft_contact_body_vel)
                 model.soft_contact_normal = wp.empty_like(model.soft_contact_normal)
@@ -1603,7 +1741,7 @@ def collide(
                     model.shape_count - 1,
                 ],
                 outputs=[
-                    model.soft_contact_count,
+                    model.soft_contact_count, 
                     model.soft_contact_particle,
                     model.soft_contact_shape,
                     model.soft_contact_body_pos,
@@ -1737,6 +1875,35 @@ def collide(
             )
 
 
+        '''
+            自定义碰撞
+        '''
+        if model.particle_count:
+            model.point_tri_contact_count.zero_()
+            model.point_tri_contact_filter.zero_()
+            model.point_tri_contact_sidedness.zero_()
+            wp.launch(
+                kernel=create_self_point_triangle_contacts,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    model.particle_inv_mass,
+                    model.particle_radius,
+                    model.particle_shape.id,
+                    model.particle_self_intersection_particle,
+                    model.point_tri_contact_max,
+                    model.gravity,
+                    dt
+                ],
+                outputs=[
+                    model.point_tri_contact_count,
+                    model.point_tri_contact_pairs,
+                    model.point_tri_contact_filter,  
+                    model.point_tri_contact_sidedness
+                ]
+            )
+            # print('model.point_tri_contact_pairs: ', model.point_tri_contact_pairs)
 @wp.func
 def compute_tri_aabb(
     v1: wp.vec3,

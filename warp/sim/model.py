@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -708,6 +708,7 @@ class Model:
         self.particle_grid = None
         self.particle_flags = None
         self.particle_max_velocity = 1e5
+        self.global_viscous_damping = np.array((0.0, 0.0, 0.0))
 
         self.shape_transform = None
         self.shape_body = None
@@ -858,6 +859,17 @@ class Model:
         self.articulation_count = 0
         self.joint_dof_count = 0
         self.joint_coord_count = 0
+        
+        '''
+            自定义的部分
+        '''
+        # for cloth self-collision
+        self.particle_shape = None
+        self.cloth_self_collision_margin = 0.1
+        self.cloth_self_collision_count = None
+        self.enable_particle_particle_collisions = False
+        self.enable_triangle_particle_collisions = False
+        self.enable_edge_edge_collisions = False
 
         # indices of particles sharing the same color
         self.particle_color_groups = []
@@ -1091,6 +1103,28 @@ class Model:
 
             # ID of thread that found the current contact point
             target.rigid_contact_tids = wp.zeros(self.rigid_contact_max, dtype=wp.int32)
+    
+    '''
+        添加自碰撞
+    '''
+    def allocate_global_self_intersection(self, count, requires_grad=False):
+
+        # TODO Proper requires_grad options for the arrays
+        self.particle_self_intersection_count = wp.zeros(1, dtype=wp.int32, device=self.device)  # For simple count
+        self.particle_global_self_intersection_count = wp.zeros(1, dtype=wp.int32, device=self.device)  # For global collision resolution
+        self.particle_self_intersection_particle = wp.zeros(self.particle_count, dtype=int, device=self.device)
+        
+        
+    def allocate_particle_tri_self_intersection(self, count, requires_grad=False):
+        
+        # TODO Proper requires_grad options for the arrays
+        self.point_tri_contact_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.point_tri_contact_pairs = wp.zeros(count, dtype=wp.vec2i, device=self.device,
+                                           requires_grad=requires_grad)
+        self.point_tri_contact_filter = wp.zeros(count, dtype=wp.bool, device=self.device)
+        self.point_tri_contact_sidedness = wp.zeros(count, dtype=wp.bool, device=self.device,
+                                            requires_grad=requires_grad)
+        
 
     @property
     def soft_contact_max(self):
@@ -1098,6 +1132,11 @@ class Model:
         if self.soft_contact_particle is None:
             return 0
         return len(self.soft_contact_particle)
+    
+    @property
+    def point_tri_contact_max(self):
+        """Maximum number of edge-edge contacts that can be registered"""
+        return len(self.point_tri_contact_pairs)
 
 
 class ModelBuilder:
@@ -1186,6 +1225,8 @@ class ModelBuilder:
         self.particle_radius = []
         self.particle_flags = []
         self.particle_max_velocity = 1e5
+        
+        self.particle_inds = [] # 自定义
         # list of np.array
         self.particle_color_groups = []
 
@@ -1326,6 +1367,10 @@ class ModelBuilder:
 
         # Maximum number of soft contacts that can be registered
         self.soft_contact_max = 64 * 1024
+        
+        '''自定义'''
+        self.point_tri_contact_max = 64  # per particle
+
 
         # maximum number of contact points to generate per mesh shape
         self.rigid_mesh_contact_max = 0  # 0 = unlimited
@@ -3566,6 +3611,14 @@ class ModelBuilder:
         l = np.sqrt(np.dot(delta, delta))
 
         self.spring_rest_length.append(l)
+        
+    def add_spring_w_rest_length(self, i: int, j: int, ke: float, kd: float, rest_len: float, control: float):
+        self.spring_indices.append(i)
+        self.spring_indices.append(j)
+        self.spring_stiffness.append(ke)
+        self.spring_damping.append(kd)
+        self.spring_control.append(control)
+        self.spring_rest_length.append(rest_len)
 
     def add_triangle(
         self,
@@ -3724,6 +3777,241 @@ class ModelBuilder:
         areas = areas.tolist()
         self.tri_areas.extend(areas)
         return areas
+
+
+    def create_triangle_with_edge_lengths(self, a, b, c, tri_indices):
+        # Given edge lengths a, b, c of a triangle
+        # Check if the edge lengths can form a valid triangle
+        if a + b <= c or a + c <= b or b + c <= a:
+            print("{}::Error::Invalid edge lengths {}. Not possible to form a triangle "
+                  "with vertex indices {}.".format(self.__class__.__name__, [a, b, c], tri_indices))
+            raise RuntimeError("{}::Error::Invalid edge lengths {}. "
+                                      "Not possible to form a triangle with vertex indices {}.".format(
+                self.__class__.__name__, [a, b, c], tri_indices))
+        # Calculate angles in radians
+        angle_A = np.arccos((b ** 2 + c ** 2 - a ** 2) / (2 * b * c))
+        # Coordinates of the vertices
+        vertex_A = np.array([0, 0, 0])
+        vertex_B = np.array([b, 0, 0])
+        vertex_C = np.array([c * np.cos(angle_A), c * np.sin(angle_A), 0])
+        return vertex_A, vertex_B, vertex_C
+
+    
+    def add_triangles_stitching(
+            self,
+            i: List[int],
+            j: List[int],
+            k: List[int],
+            orig_lens: dict = None,
+            tri_ke: Optional[List[float]] = None,
+            tri_ka: Optional[List[float]] = None,
+            tri_kd: Optional[List[float]] = None,
+            tri_drag: Optional[List[float]] = None,
+            tri_lift: Optional[List[float]] = None,
+    ) -> List[float]:
+        """Adds triangular FEM elements between groups of three particles in the system.
+        Triangles are modeled as viscoelastic elements with elastic stiffness and damping
+        Parameters specified on the model. See model.tri_ke, model.tri_kd.
+        Args:
+            i: The indices of the first particle
+            j: The indices of the second particle
+            k: The indices of the third particle
+        Return:
+            The areas of the triangles
+        Note:
+            A triangle is created with a rest-length based on the distance
+            between the particles in their initial configuration.
+        """
+        
+        areas = []
+        Ds = []
+        particle_q_np = np.array(self.particle_q)
+        for ids, tri_inds in enumerate(zip(i, j, k)):
+            # print(f'tri_no. {ids}')
+            ind1, ind2, ind3 = sorted(tri_inds)
+            v_1 = particle_q_np[ind1]
+            v_2 = particle_q_np[ind2]
+            v_3 = particle_q_np[ind3]
+        
+            # Retrieve edge lengths from orig_lens if available, otherwise compute from current positions
+            key12 = (ind1, ind2) 
+            if orig_lens is not None and key12 in orig_lens:
+                el1 = orig_lens[key12]
+            else:
+                el1 = np.linalg.norm(v_1 - v_2)
+
+            key23 = (ind2, ind3) 
+            if orig_lens is not None and key23 in orig_lens:
+                el2 = orig_lens[key23]
+            else:
+                el2 = np.linalg.norm(v_2 - v_3)
+
+            key13 = (ind1, ind3)
+            if orig_lens is not None and key13 in orig_lens:
+                el3 = orig_lens[key13]
+            else:
+                el3 = np.linalg.norm(v_1 - v_3)
+                
+            p, q, r = self.create_triangle_with_edge_lengths(el1, el2, el3, tri_inds)
+            qp = q - p
+            rp = r - p
+            n = wp.normalize(wp.cross(qp, rp))
+            e1 = wp.normalize(qp)
+            e2 = wp.normalize(wp.cross(n, e1))
+            R = np.array((e1, e2))
+            M = np.array((qp, rp))
+            D = R @ M.T
+            area_0 = np.linalg.det(D) / 2.0
+            Ds.append(D)
+            areas.append(area_0)
+            # areas = np.array(areas)
+            D = np.stack(Ds, axis=0)
+
+        areas = np.array(areas)
+        # following is the same as add_triangles
+        areas[areas < 0.0] = 0.0
+        valid_inds = (areas > 0.0).nonzero()[0]
+        if len(valid_inds) < len(areas):
+            print("inverted or degenerate triangle elements")
+        D[areas == 0.0] = np.eye(2)[None, ...]
+        inv_D = np.linalg.pinv(D)
+        inds = np.concatenate((i[valid_inds, None], j[valid_inds, None], k[valid_inds, None]), axis=-1)
+        self.tri_indices.extend(inds.tolist())
+        self.tri_poses.extend(inv_D[valid_inds].tolist())
+        self.tri_activations.extend([0.0] * len(valid_inds))
+
+        def init_if_none(arr, defaultValue):
+            if arr is None:
+                return [defaultValue] * len(areas)
+            return arr
+
+        tri_ke = init_if_none(tri_ke, self.default_tri_ke)
+        tri_ka = init_if_none(tri_ka, self.default_tri_ka)
+        tri_kd = init_if_none(tri_kd, self.default_tri_kd)
+        tri_drag = init_if_none(tri_drag, self.default_tri_drag)
+        tri_lift = init_if_none(tri_lift, self.default_tri_lift)
+        self.tri_materials.extend(
+            zip(
+                np.array(tri_ke)[valid_inds],
+                np.array(tri_ka)[valid_inds],
+                np.array(tri_kd)[valid_inds],
+                np.array(tri_drag)[valid_inds],
+                np.array(tri_lift)[valid_inds],
+            )
+        )
+        areas = areas.tolist()
+        self.tri_areas.extend(areas)
+        return areas
+
+
+    def add_triangles_stitching_optimized(
+        self,
+        i: List[int],
+        j: List[int],
+        k: List[int],
+        orig_lens: dict = None,
+        tri_ke: Optional[List[float]] = None,
+        tri_ka: Optional[List[float]] = None,
+        tri_kd: Optional[List[float]] = None,
+        tri_drag: Optional[List[float]] = None,
+        tri_lift: Optional[List[float]] = None,
+    ) -> List[float]:
+        """
+        向量化版本，用于添加三角元
+        """
+        num_triangles = len(i)
+        particle_q_np = np.array(self.particle_q)
+        
+        # 1. 一次性提取所有顶点
+        v_i = particle_q_np[i]
+        v_j = particle_q_np[j]
+        v_k = particle_q_np[k]
+
+        # 2. 向量化计算所有边长
+        a = np.linalg.norm(v_j - v_k, axis=1)
+        b = np.linalg.norm(v_i - v_k, axis=1)
+        c = np.linalg.norm(v_i - v_j, axis=1)
+        
+        # 3. 向量化计算局部坐标系
+        cos_A = (b**2 + c**2 - a**2) / (2 * b * c + 1e-9)
+        angle_A = np.arccos(np.clip(cos_A, -1.0, 1.0))
+        
+        p = np.zeros((num_triangles, 3))
+        q = np.stack([c, np.zeros(num_triangles), np.zeros(num_triangles)], axis=1)
+        r = np.stack([b * np.cos(angle_A), b * np.sin(angle_A), np.zeros(num_triangles)], axis=1)
+        
+        # 4. 向量化计算面积和逆矩阵 D
+        qp = q - p
+        rp = r - p
+
+        s = (a + b + c) / 2.0
+        # 使用 np.maximum 确保 sqrt 的参数非负
+        areas = np.sqrt(np.maximum(0, s * (s - a) * (s - b) * (s - c)))
+        
+        n = np.cross(qp, rp)
+        n_norm = np.linalg.norm(n, axis=1, keepdims=True)
+        n = n / (n_norm + 1e-9)
+        
+        e1 = qp / (np.linalg.norm(qp, axis=1, keepdims=True) + 1e-9)
+        e2 = np.cross(n, e1)
+
+        M = np.stack([qp, rp], axis=1)
+        R = np.stack([e1, e2], axis=1)
+        D = np.einsum('nij,nkj->nik', R, M) 
+        
+        # 5. 筛选有效三角形并计算逆矩阵
+        epsilon = 1e-9
+        # 同时检查三角不等式和面积
+        tri_inequality_mask = (a + b > c) & (a + c > b) & (b + c > a)
+        final_valid_mask = (areas > epsilon) & tri_inequality_mask
+        valid_inds = np.where(final_valid_mask)[0]
+
+        if len(valid_inds) == 0:
+            print("警告: 没有有效的三角形被添加。")
+            return []
+
+        D_valid = D[valid_inds]
+        inv_D = np.linalg.pinv(D_valid)
+        
+        # 将原始列表转换为NumPy数组以便于索引
+        i_np, j_np, k_np = np.array(i), np.array(j), np.array(k)
+        inds = np.stack([i_np[valid_inds], j_np[valid_inds], k_np[valid_inds]], axis=-1)
+        
+        # 6. 一次性扩展列表 (extend)，而不是循环 append
+        self.tri_indices.extend(inds.tolist())
+        
+        # === 关键修正 1 ===
+        # inv_D 已经是一个只包含有效数据的紧凑数组，直接使用即可
+        self.tri_poses.extend(inv_D.tolist())
+        
+        self.tri_activations.extend([0.0] * len(valid_inds))
+
+        def init_if_none(arr, defaultValue):
+            if arr is None:
+                return np.full(num_triangles, defaultValue) # 返回 NumPy 数组以便于索引
+            return np.array(arr)
+
+        # 筛选材质属性
+        tri_ke = init_if_none(tri_ke, self.default_tri_ke)[valid_inds]
+        tri_ka = init_if_none(tri_ka, self.default_tri_ka)[valid_inds]
+        tri_kd = init_if_none(tri_kd, self.default_tri_kd)[valid_inds]
+        tri_drag = init_if_none(tri_drag, self.default_tri_drag)[valid_inds]
+        tri_lift = init_if_none(tri_lift, self.default_tri_lift)[valid_inds]
+        
+        self.tri_materials.extend(zip(tri_ke, tri_ka, tri_kd, tri_drag, tri_lift))
+
+        # === 关键修正 2 ===
+        # 只扩展和返回有效三角形的面积
+        
+        areas = areas.tolist()
+        self.tri_areas.extend(areas)
+        return areas
+        # valid_areas = areas[valid_inds]
+        # self.tri_areas.extend(valid_areas.tolist())
+        
+        # return valid_areas.tolist()
+
+
 
     def add_tetrahedron(
         self, i: int, j: int, k: int, l: int, k_mu: float = 1.0e3, k_lambda: float = 1.0e3, k_damp: float = 0.0
@@ -4117,6 +4405,7 @@ class ModelBuilder:
 
         # triangles
         inds = start_vertex + np.array(indices)
+        self.particle_inds.extend(inds.reshape(-1).tolist()) # 自定义
         inds = inds.reshape(-1, 3)
         areas = self.add_triangles(
             inds[:, 0],
@@ -4163,11 +4452,198 @@ class ModelBuilder:
                 if j != -1:
                     spring_indices.add((min(j, k), max(j, k)))
                     spring_indices.add((min(j, l), max(j, l)))
-                if i != -1 and j != -1:
-                    spring_indices.add((min(i, j), max(i, j)))
+                # if i != -1 and j != -1:
+                #     spring_indices.add((min(i, j), max(i, j)))
 
             for i, j in spring_indices:
                 self.add_spring(i, j, spring_ke, spring_kd, control=0.0)
+
+    def add_cloth_mesh_with_different_material(
+        self,
+        pos: Vec3,
+        rot: Quat,
+        scale: float,
+        vel: Vec3,
+        
+        vertices: list[Vec3],
+        indices: list[int],
+        rest_len: dict,
+        density: list[float],
+        tri_ke: list[float], 
+        tri_ka: list[float], 
+        tri_kd: list[float], 
+        tri_drag: list[float], 
+        tri_lift: list[float], 
+        edge_ke: list[float],
+        edge_kd: list[float], 
+        spring_ke: list[float], 
+        spring_kd: list[float],
+        particle_radius: list[float], 
+        add_springs: bool = False,
+    ):
+        '''
+            区分不同板片的材质（仿真参数）
+            上游会把不同板片的材质参数合并：
+                三角面的参数 tri_ke, tri_ka, tri_kd, tri_drag, tri_lift, density
+                边的参数 edge_ke, edge_kd
+                点的参数 particle_radius
+            考虑到不同板片间被缝合面连接，交界区域会出现————缝合面和板片面共点共边；
+            我们规定，缝合面、顶点、边是二等公民，出现缝合面时，缝合面和板片面共点共边的顶点、边、三角面都使用板片面的材质参数；
+            这些逻辑都在上游被处理，这里只是重申一下。
+        '''
+        num_tris = int(len(indices) / 3)
+        
+        # 声明 tri_xx 、density 参数的数量和面 的数量一致
+        if tri_ke is not None and len(tri_ke) != num_tris:
+            raise ValueError(f"tri_ke should have {num_tris} elements, got {len(tri_ke)}")
+        if tri_ka is not None and len(tri_ka) != num_tris:
+            raise ValueError(f"tri_ka should have {num_tris} elements, got {len(tri_ka)}")
+        if tri_kd is not None and len(tri_kd) != num_tris:
+            raise ValueError(f"tri_kd should have {num_tris} elements, got {len(tri_kd)}")
+        if tri_drag is not None and len(tri_drag) != num_tris:
+            raise ValueError(f"tri_drag should have {num_tris} elements, got {len(tri_drag)}")
+        if tri_lift is not None and len(tri_lift) != num_tris:
+            raise ValueError(f"tri_lift should have {num_tris} elements, got {len(tri_lift)}")
+        if density is not None and len(density) != num_tris:
+            raise ValueError(f"density should have {num_tris} elements, got {len(density)}")
+        
+        # 声明 vertices 和 particle_radius 参数的数量和顶点 的数量一致  
+        if particle_radius is not None and len(particle_radius) != len(vertices):
+            raise ValueError(f"particle_radius should have {len(vertices)} elements, got {len(particle_radius)}")
+
+        start_vertex = len(self.particle_q)
+        start_tri = len(self.tri_indices)
+
+        # particles
+        for v_idx, v in enumerate(vertices):
+            p = wp.quat_rotate(rot, v * scale) + pos
+            self.add_particle(p, vel, 0.0, radius=particle_radius[v_idx])
+        
+        pass
+    
+    def add_cloth_mesh_with_stitches(
+        self,
+        pos: Vec3,
+        rot: Quat,
+        scale: float,
+        vel: Vec3,
+        vertices: list[Vec3],
+        indices: list[int],
+        rest_len: dict,
+        density: float,
+        edge_callback=None,
+        face_callback=None,
+        tri_ke: float | None = None,
+        tri_ka: float | None = None,
+        tri_kd: float | None = None,
+        tri_drag: float | None = None,
+        tri_lift: float | None = None,
+        edge_ke: float | None = None,
+        edge_kd: float | None = None,
+        add_springs: bool = False,
+        spring_ke: float | None = None,
+        spring_kd: float | None = None,
+        particle_radius: float | None = None,
+    ) -> None:
+        """Helper to create a cloth model from a regular triangle mesh
+
+        Creates one FEM triangle element and one bending element for every face
+        and edge in the input triangle mesh
+
+        Args:
+            pos: The position of the cloth in world space
+            rot: The orientation of the cloth in world space
+            vel: The velocity of the cloth in world space
+            vertices: A list of vertex positions
+            indices: A list of triangle indices, 3 entries per-face
+            density: The density per-area of the mesh
+            edge_callback: A user callback when an edge is created
+            face_callback: A user callback when a face is created
+            particle_radius: The particle_radius which controls particle based collisions.
+        Note:
+
+            The mesh should be two manifold.
+        """
+        tri_ke = tri_ke if tri_ke is not None else self.default_tri_ke
+        tri_ka = tri_ka if tri_ka is not None else self.default_tri_ka
+        tri_kd = tri_kd if tri_kd is not None else self.default_tri_kd
+        tri_drag = tri_drag if tri_drag is not None else self.default_tri_drag
+        tri_lift = tri_lift if tri_lift is not None else self.default_tri_lift
+        edge_ke = edge_ke if edge_ke is not None else self.default_edge_ke
+        edge_kd = edge_kd if edge_kd is not None else self.default_edge_kd
+        spring_ke = spring_ke if spring_ke is not None else self.default_spring_ke
+        spring_kd = spring_kd if spring_kd is not None else self.default_spring_kd
+        particle_radius = particle_radius if particle_radius is not None else self.default_particle_radius
+
+        num_tris = int(len(indices) / 3)
+
+        start_vertex = len(self.particle_q)
+        start_tri = len(self.tri_indices)
+
+        # particles
+        for v in vertices:
+            p = wp.quat_rotate(rot, v * scale) + pos
+
+            self.add_particle(p, vel, 0.0, radius=particle_radius)
+
+        # triangles
+        inds = start_vertex + np.array(indices)
+        self.particle_inds.extend(inds.reshape(-1).tolist()) # 自定义
+        inds = inds.reshape(-1, 3)
+        areas = self.add_triangles_stitching(
+            inds[:, 0],
+            inds[:, 1],
+            inds[:, 2],
+            rest_len,
+            [tri_ke] * num_tris,
+            [tri_ka] * num_tris,
+            [tri_kd] * num_tris,
+            [tri_drag] * num_tris,
+            [tri_lift] * num_tris,
+        )
+
+        for t in range(num_tris):
+            area = areas[t]
+
+            self.particle_mass[inds[t, 0]] += density * area / 3.0
+            self.particle_mass[inds[t, 1]] += density * area / 3.0
+            self.particle_mass[inds[t, 2]] += density * area / 3.0
+
+        end_tri = len(self.tri_indices)
+
+        adj = wp.utils.MeshAdjacency(self.tri_indices[start_tri:end_tri], end_tri - start_tri)
+
+        edge_indices = np.fromiter(
+            (x for e in adj.edges.values() for x in (e.o0, e.o1, e.v0, e.v1)),
+            int,
+        ).reshape(-1, 4)
+        self.add_edges(
+            edge_indices[:, 0],
+            edge_indices[:, 1],
+            edge_indices[:, 2],
+            edge_indices[:, 3],
+            edge_ke=[edge_ke] * len(edge_indices),
+            edge_kd=[edge_kd] * len(edge_indices),
+        )
+
+        if add_springs:
+            spring_indices = set()
+            for i, j, k, l in edge_indices:
+                spring_indices.add((min(k, l), max(k, l)))
+                if i != -1:
+                    spring_indices.add((min(i, k), max(i, k)))
+                    spring_indices.add((min(i, l), max(i, l)))
+                if j != -1:
+                    spring_indices.add((min(j, k), max(j, k)))
+                    spring_indices.add((min(j, l), max(j, l)))
+                # if i != -1 and j != -1:
+                #     spring_indices.add((min(i, j), max(i, j)))
+
+            for i, j in spring_indices:
+                if (i, j) in rest_len:
+                    self.add_spring_w_rest_length(i, j, spring_ke, spring_kd, rest_len[i,j], control=0.0)
+                else:
+                    self.add_spring(i, j, spring_ke, spring_kd, control=0.0)
 
     def add_particle_grid(
         self,
@@ -4613,6 +5089,14 @@ class ModelBuilder:
 
             # hash-grid for particle interactions
             m.particle_grid = wp.HashGrid(128, 128, 128)
+            
+            '''
+                自定义
+            '''
+            # TODO It's only needed in case of simulating meshes. Under a flag in add cloth_mesh routines
+            # build shape of particles  
+            m.particle_shape = wp.Mesh(points=wp.array(self.particle_q, dtype=wp.vec3),
+                                       indices=wp.array(self.particle_inds, dtype=int))
 
             # ---------------------
             # collision geometry
@@ -4764,7 +5248,7 @@ class ModelBuilder:
             )
             m.joint_enabled = wp.array(self.joint_enabled, dtype=wp.int32)
 
-            # 'close' the start index arrays with a sentinel value
+            # close the start index arrays with a sentinel value
             joint_q_start = copy.copy(self.joint_q_start)
             joint_q_start.append(self.joint_coord_count)
             joint_qd_start = copy.copy(self.joint_qd_start)
@@ -4794,6 +5278,22 @@ class ModelBuilder:
             # contacts
             if m.particle_count:
                 m.allocate_soft_contacts(self.soft_contact_max, requires_grad=requires_grad)
+                
+                '''
+                    自定义
+                '''
+                # self.edge_contact_max *= self.spring_count
+                self.point_tri_contact_max *= m.particle_count
+                m.allocate_particle_tri_self_intersection(
+                    self.point_tri_contact_max, requires_grad=requires_grad)
+                # m.allocate_edge_self_intersection(
+                #     self.edge_contact_max, requires_grad=requires_grad)
+                m.allocate_global_self_intersection(
+                    m.edge_count, requires_grad=requires_grad
+                )
+                
+                
+                
             m.find_shape_contact_pairs()
             if self.num_rigid_contacts_per_env is None:
                 contact_count, limited_contact_count = m.count_contact_points()

@@ -29,6 +29,166 @@ from .model import (
 from .utils import vec_abs, vec_leaky_max, vec_leaky_min, vec_max, vec_min, velocity_at_point
 
 
+
+'''
+    自定义算子
+'''
+
+@wp.func
+def triangle_closest_point_barycentric(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3):
+    ab = b - a
+    ac = c - a
+    ap = p - a
+
+    d1 = wp.dot(ab, ap)
+    d2 = wp.dot(ac, ap)
+
+    if d1 <= 0.0 and d2 <= 0.0:
+        return wp.vec3(1.0, 0.0, 0.0)
+
+    bp = p - b
+    d3 = wp.dot(ab, bp)
+    d4 = wp.dot(ac, bp)
+
+    if d3 >= 0.0 and d4 <= d3:
+        return wp.vec3(0.0, 1.0, 0.0)
+
+    vc = d1 * d4 - d3 * d2
+    v = d1 / (d1 - d3)
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        return wp.vec3(1.0 - v, v, 0.0)
+
+    cp = p - c
+    d5 = wp.dot(ab, cp)
+    d6 = wp.dot(ac, cp)
+
+    if d6 >= 0.0 and d5 <= d6:
+        return wp.vec3(0.0, 0.0, 1.0)
+
+    vb = d5 * d2 - d1 * d6
+    w = d2 / (d2 - d6)
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        return wp.vec3(1.0 - w, 0.0, w)
+
+    va = d3 * d6 - d5 * d4
+    w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        return wp.vec3(0.0, 1.0 - w, w)
+
+    denom = 1.0 / (va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+
+    return wp.vec3(1.0 - v - w, v, w)
+
+
+
+@wp.kernel
+def solve_particle_triangle_self_contacts(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_invmass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_shape: wp.uint64,
+    point_tri_contact_count: wp.array(dtype=int),
+    point_tri_contact_pairs: wp.array(dtype=wp.vec2i),
+    point_tri_contact_filter: wp.array(dtype=bool),  
+    point_tri_contact_sidedness: wp.array(dtype=bool),
+    # outputs
+    delta: wp.array(dtype=wp.vec3),
+):
+    """For a given pair of particle-triangle, checks if a collision happened and resolve"""
+    tid = wp.tid() # current point-triangle pair
+    if tid >= point_tri_contact_count[0] or point_tri_contact_filter[tid]:
+        # to be skipped 
+        return
+    
+    # Info
+    pair = point_tri_contact_pairs[tid]
+    particle_index, face_index = pair[0], pair[1]
+
+    p = particle_x[particle_index]
+    radius = particle_radius[particle_index]  # NOTE == Thickness
+    wpoint = particle_invmass[particle_index]
+
+    mesh = wp.mesh_get(particle_shape)
+
+    # Parameters
+    # TODO from outside
+    EPSILON = 0.00001
+    relaxation = 1. 
+
+    p_delta = wp.vec3(0.0)
+
+    p0_idx = mesh.indices[face_index * 3 + 0]
+    p1_idx = mesh.indices[face_index * 3 + 1]
+    p2_idx = mesh.indices[face_index * 3 + 2]
+
+    p0 = particle_x[p0_idx] 
+    p1 = particle_x[p1_idx] 
+    p2 = particle_x[p2_idx] 
+
+    w0 = particle_invmass[p0_idx]
+    w1 = particle_invmass[p1_idx]
+    w2 = particle_invmass[p2_idx]
+
+    # Closest point
+    bary_closest = triangle_closest_point_barycentric(p0, p1, p2, p)
+    baryAlpha, baryBeta, baryGamma = bary_closest[0], bary_closest[1], bary_closest[2]
+    pC = baryAlpha * p0 + baryBeta * p1 + baryGamma * p2
+
+    ########
+    #Set up constraints:
+    # https://github.com/vasumahesh1/azura/blob/master/Source/Samples/3_ClothSim/Shaders/SolvingPass_Cloth_GenerateSelfCollisions.cs.slang
+    normal = wp.cross(p1 - p0, p2 - p0) 
+    n_norm = wp.length(normal)
+    n_hat = wp.normalize(normal) 
+
+    # Apply contact sidedness if required
+    if point_tri_contact_sidedness[tid]:  
+        n_hat = -1.0 * n_hat
+
+    # NOTE: Using pC instead of p0 as in the paper (suspect typo)
+    # Because it makes the most sence to compare with closest point
+    c_def = wp.dot(n_hat, p - pC) - 2.0 * radius  
+
+    #Apply constaints:
+    # https://github.com/vasumahesh1/azura/blob/master/Source/Samples/3_ClothSim/Shaders/SolvingPass_Cloth_ApplyConstraints.cs.slang
+    # https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/gdc2018-chrislewin-clothselfcollisionwithpredictivecontacts.pdf
+    if c_def < 0.0:
+        a = n_hat[0]
+        b = n_hat[1]
+        c = n_hat[2]
+        a2 = a * a
+        b2 = b * b
+        c2 = c * c
+        N_n_hat = wp.vec3(
+            a - (a2 * a) - (a * b2) - (a * c2),
+            (-a2 * b) + b - (b2 * b) - (b * c2),
+            (-a2 * c) - (b2 * c) + c - (c2 * c)
+        )
+
+        N_n_hat = N_n_hat / n_norm
+
+        grad_c_p = n_hat
+        grad_c_p0 = wp.cross((p1 - p2), N_n_hat) - n_hat
+        grad_c_p1 = wp.cross((p2 - p0), N_n_hat)
+        grad_c_p2 = wp.cross((p1 - p0), N_n_hat)
+
+        denom = w0 * wp.dot(grad_c_p0, grad_c_p0) + w1 * wp.dot(grad_c_p1, grad_c_p1) + w2 * wp.dot(grad_c_p2, grad_c_p2) + wpoint
+
+        if abs(denom) > EPSILON:
+            # NOTE: No need for alpha/damping for this constraint
+            # as it should be as hard as possible
+            dlambda = (-1.0 * c_def) / denom   # Constraint value   
+
+            p_delta = wpoint * dlambda * grad_c_p  
+
+            # TODO Account for friction
+
+            wp.atomic_add(delta, particle_index, relaxation * p_delta)
+
+
+
 @wp.kernel
 def solve_particle_ground_contacts(
     particle_x: wp.array(dtype=wp.vec3),
@@ -898,6 +1058,7 @@ def apply_particle_deltas(
     v_new_mag = wp.length(v_new)
     if v_new_mag > v_max:
         v_new *= v_max / v_new_mag
+        x_new = x0 + v_new * dt  # NOTE: Update x in accordance with damped velocity for more stability
 
     x_out[tid] = x_new
     v_out[tid] = v_new
@@ -2941,6 +3102,28 @@ class XPBDIntegrator(Integrator):
                                 outputs=[particle_deltas, body_deltas],
                                 device=model.device,
                             )
+                            
+                            # particle and mesh self-collisions
+                            if model.particle_max_radius > 0.0:
+                                if model.enable_triangle_particle_collisions:
+                                    # print('enable_triangle_particle_collisions: True')
+                                    wp.launch(
+                                        kernel=solve_particle_triangle_self_contacts,
+                                        dim=model.point_tri_contact_max,
+                                        inputs=[
+                                            particle_q,
+                                            model.particle_inv_mass,
+                                            model.particle_radius,
+                                            model.particle_shape.id,
+                                            model.point_tri_contact_count,
+                                            model.point_tri_contact_pairs,
+                                            model.point_tri_contact_filter,  
+                                            model.point_tri_contact_sidedness
+                                        ],
+                                        outputs=[particle_deltas],
+                                        device=model.device,
+                                    )
+
 
                         if model.particle_max_radius > 0.0 and model.particle_count > 1:
                             # assert model.particle_grid.reserved, "model.particle_grid must be built, see HashGrid.build()"
